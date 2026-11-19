@@ -1,4 +1,4 @@
-"""Builds TikTok-style burned-in captions (.ass) from word timestamps.
+"""Builds TikTok-style burned-in captions (.ass) from word timestamps, plus a hook title.
 
 Words are shown a few at a time, and the word being spoken is highlighted,
 so the captions stay locked to the speaker's voice.
@@ -49,11 +49,21 @@ def _escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("{", "(").replace("}", ")").replace("\n", " ")
 
 
-def build_ass(words: list[Word], width: int, height: int, clip_duration: float, uppercase: bool = True) -> str:
+def build_ass(
+    words: list[Word],
+    width: int,
+    height: int,
+    clip_duration: float,
+    hook: str | None = None,
+    uppercase: bool = True,
+) -> str:
     vertical = height > width
     font_size = round(height * (0.045 if vertical else 0.075))
     margin_v = round(height * (0.27 if vertical else 0.08))  # vertical: clear of the app's UI
     outline = max(3, round(font_size * 0.09))
+    hook_size = round(height * (0.038 if vertical else 0.062))
+    hook_margin = round(height * (0.11 if vertical else 0.045))
+    side = round(width * 0.06)
 
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -64,12 +74,16 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,Arial,{font_size},{WHITE},{WHITE},{OUTLINE},&H80000000,-1,0,0,0,100,100,0,0,1,{outline},2,2,{round(width * 0.06)},{round(width * 0.06)},{margin_v},1
+Style: Caption,Arial,{font_size},{WHITE},{WHITE},{OUTLINE},&H80000000,-1,0,0,0,100,100,0,0,1,{outline},2,2,{side},{side},{margin_v},1
+Style: Hook,Arial,{hook_size},&H00000000,&H00000000,{WHITE},&H00000000,-1,0,0,0,100,100,0,0,3,{round(hook_size * 0.35)},0,8,{side},{side},{hook_margin},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events = []
+    if hook:
+        # A fixed title on a white box at the top, on screen for the whole clip.
+        events.append(f"Dialogue: 1,{_ts(0)},{_ts(clip_duration)},Hook,,0,0,0,,{_escape(hook)}")
     chunks = chunk_words(words)
     for ci, chunk in enumerate(chunks):
         next_start = chunks[ci + 1][0].start if ci + 1 < len(chunks) else clip_duration
@@ -88,6 +102,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return header + "\n".join(events) + "\n"
 
 
-def write_ass(words: list[Word], width: int, height: int, clip_duration: float, out: Path) -> Path:
-    out.write_text(build_ass(words, width, height, clip_duration), encoding="utf-8")
+def write_ass(
+    words: list[Word], width: int, height: int, clip_duration: float, out: Path, hook: str | None = None
+) -> Path:
+    out.write_text(build_ass(words, width, height, clip_duration, hook), encoding="utf-8")
     return out

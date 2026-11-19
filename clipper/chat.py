@@ -36,6 +36,7 @@ class TwitchChat:
         self._messages: deque[ChatMessage] = deque()
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self.listening_since: float | None = None
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="chat").start()
@@ -57,6 +58,8 @@ class TwitchChat:
         with socket.create_connection((IRC_HOST, IRC_PORT), timeout=300) as sock:
             sock.sendall(f"NICK {nick}\r\nJOIN #{self.channel}\r\n".encode())
             log.info("Joined Twitch chat #%s", self.channel)
+            if self.listening_since is None:
+                self.listening_since = time.time()
             buf = b""
             while not self._stop.is_set():
                 data = sock.recv(4096)
@@ -74,6 +77,8 @@ class TwitchChat:
                         self._add(ChatMessage(time.time(), m.group(1), m.group(2)))
 
     def _add(self, msg: ChatMessage) -> None:
+        if self.listening_since is None:
+            self.listening_since = msg.ts
         with self._lock:
             self._messages.append(msg)
             cutoff = msg.ts - self.keep_seconds
