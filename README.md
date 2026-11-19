@@ -30,6 +30,29 @@ Twitch chat ──────────────── speed + reaction ty
 
    Each finished clip is logged to `clips/clips.jsonl` with its edits.
 
+## Clipping a recording (e.g. a screen recording)
+
+Pass a video file instead of a link:
+
+```bash
+python -m clipper my_screen_recording.mp4 --vertical
+```
+
+1. **Finds the stream on your screen**: Claude looks at a frame and finds the stream player and the chat panel, so clips contain only the stream, not your browser, desktop or taskbar. A check image with both boxes drawn on (`buffer/<name>/layout_preview.jpg`) is saved; if a box is off, set it yourself with `--crop W:H:X:Y` (and `--chat-crop`), or use `--no-crop` if the file is already just the stream.
+2. **Analyzes the whole recording at once**: transcript, loudness, on-screen action, and how fast the on-screen chat is scrolling (a stand-in for chat speed, since chat in a video isn't text).
+3. **Ranks the best moments** and has Claude review them one by one. Claude can **read the chat panel** from the recording to see how viewers reacted, and look at frames from the stream.
+4. **Final pass**: Claude reads the full transcript for stories, hot takes and other quieter moments the signals can't hear.
+5. Clips are cut and edited exactly as in live mode (hook, captions, sound effects, music) and named after the recording and the time they start, e.g. `my_screen_recording_12m34s_jump-scare.mp4`.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--max-clips` | 10 | Stop after this many clips |
+| `--max-reviews` | 15 | Most candidate moments Claude reviews (each review costs API usage) |
+| `--crop` / `--chat-crop` | found automatically | Player / chat position in pixels, `W:H:X:Y` |
+| `--no-crop` | off | The file is already just the stream |
+
+Tips: record at 1080p if you can (clips can only be as sharp as the recording), and turn off notifications while recording, since anything inside the stream player ends up in the clips.
+
 ## Sound effects and music
 
 On first run, a starter library of royalty-free sounds is synthesized into `assets/`:
@@ -96,6 +119,8 @@ Set `CLIPPER_MODEL` to use a different Claude model (default `claude-opus-5-5`).
 | `clipper/chat.py` | Anonymous Twitch IRC reader + chat-rate stats |
 | `clipper/signals.py` | Moment detector: audio, video, chat reactions and speech, scored against the stream's normal |
 | `clipper/frames.py` | Grabs still frames so Claude can see the video |
+| `clipper/filesource.py` | Recording mode: crops a video file to the player and splits it like a live buffer |
+| `clipper/layout.py` | Finds the stream player and chat panel in a screen recording |
 | `clipper/transcriber.py` | Live faster-whisper transcription of segments |
 | `clipper/clips.py` | Cuts clips out of the buffer with ffmpeg |
 | `clipper/whisper.py` | Shared Whisper model, word-level timestamps |

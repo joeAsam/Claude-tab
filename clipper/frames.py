@@ -13,9 +13,11 @@ def grab_frame(recorder: StreamRecorder, t: float, width: int = 640) -> bytes | 
     seg = next((s for s in recorder.segments() if s.start <= t < s.end), None)
     if not seg:
         return None
+    # Seek after -i (decode up to the frame): exact, and works whatever the keyframe spacing.
+    # Segments are short, so this stays fast.
     result = subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-ss", f"{max(t - seg.start, 0):.2f}", "-i", str(seg.path),
+         "-i", str(seg.path), "-ss", f"{max(t - seg.start, 0):.2f}",
          "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "5",
          "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
         capture_output=True, timeout=30,

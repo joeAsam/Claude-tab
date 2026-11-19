@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -28,8 +29,9 @@ from typing_extensions import NotRequired
 from . import whisper
 from .captions import write_ass
 from .chat import TwitchChat
-from .clips import Clip, clip_basename, cut_clip
+from .clips import Clip, cut_clip, slugify
 from .editor import SoundCue, probe, render
+from .filesource import FileSource
 from .frames import grab_frame, image_block
 from .recorder import StreamRecorder
 from .signals import SignalMonitor
@@ -55,6 +57,8 @@ stream through tools and find the moments that would make people stop scrolling,
 watch to the end and share: funny, rage, hype, fails, shocking, wholesome, \
 intriguing, unique, impressive. Then you cut and edit them into finished \
 Shorts/TikTok-style videos.
+
+{source_note}
 
 ## What makes a moment worth clipping
 Rate every candidate from 1 to 10 on these, then give an overall virality score:
@@ -136,6 +140,21 @@ or why nothing qualified.
 """
 
 
+SOURCE_NOTES = {
+    "live": (
+        "You are watching a LIVE stream. All times you give and receive are in seconds "
+        "before now: 30 means 30 seconds ago."
+    ),
+    "recording": (
+        "You are working on a RECORDING of a stream (often a screen recording, already cropped "
+        "to the stream player). All times you give and receive are in seconds from the start of "
+        "the recording. Chat isn't available as text: the \"on-screen chat scrolling\" signal shows "
+        "how fast chat was moving, and view_chat shows you the chat panel itself so you can read "
+        "how viewers reacted (if the recording shows chat)."
+    ),
+}
+
+
 class SoundEffectCue(TypedDict):
     sound: str
     at_seconds: float
@@ -158,6 +177,42 @@ class ClipAgentConfig:
     fixed_hook: str | None = None  # same hook text on every clip, instead of Claude writing one
 
 
+class Timeline:
+    """Converts between the times Claude uses and real (timeline) timestamps."""
+
+    def __init__(self, recording: FileSource | None, now: float) -> None:
+        self.recording = recording
+        self.now = now
+        if recording:
+            self.origin = recording.virtual_start
+            self.unit = "seconds from the start of the recording"
+            self.default_to = "omit for the end of the recording"
+        else:
+            self.origin = now
+            self.unit = "seconds before now (30 = 30 seconds ago)"
+            self.default_to = "omit for now"
+
+    def to_abs(self, t: float | None) -> float:
+        if t is None:
+            return self.recording.available_range()[1] if self.recording else self.now
+        return self.origin + t if self.recording else self.now - t
+
+    def rel(self, t: float) -> int:
+        return round(t - self.origin) if self.recording else round(self.now - t)
+
+    def label(self, t: float) -> str:
+        if self.recording:
+            s = self.rel(t)
+            return f"{s // 60}:{s % 60:02d} ({s}s)"
+        return f"-{self.rel(t)}s"
+
+
+def _tool(fn, tl: Timeline):
+    """Fill the time-unit wording into a tool's docstring, then register it as a tool."""
+    fn.__doc__ = fn.__doc__.format(unit=tl.unit, default_to=tl.default_to)
+    return beta_tool(fn)
+
+
 class ClipAgent:
     def __init__(
         self,
@@ -166,7 +221,9 @@ class ClipAgent:
         transcriber: Transcriber | None,
         signals: SignalMonitor | None,
         config: ClipAgentConfig,
+        recording: FileSource | None = None,
     ) -> None:
+        self.recording = recording
         self.recorder = recorder
         self.chat = chat
         self.transcriber = transcriber
@@ -182,6 +239,7 @@ class ClipAgent:
             min_clip=config.min_clip,
             max_clip=config.max_clip,
             min_score=config.min_score,
+            source_note=SOURCE_NOTES["recording" if recording else "live"],
             edit_note=self._edit_note(),
         )
 
@@ -201,137 +259,150 @@ class ClipAgent:
 
     # ---- one review ------------------------------------------------------
 
-    def review(self, trigger: str) -> None:
-        now = time.time()
+    def review(self, trigger: str, focus: tuple[float, float] | None = None) -> None:
+        """One investigation. `focus` is the timeline range the briefing should describe
+        (default: the last 5 minutes of a live stream)."""
+        tl = Timeline(self.recording, time.time())
+        T, L = tl.to_abs, tl.label
 
-        def ts(seconds_ago: float) -> float:
-            return now - seconds_ago
-
-        def ago(t: float) -> int:
-            return round(now - t)
-
-        @beta_tool
         def get_buffer_info() -> str:
-            """Return how far back the recorded video goes and which inputs are available."""
+            """Return the time range of the footage you can clip from and which inputs are available."""
             rng = self.recorder.available_range()
             if not rng:
-                return "The buffer is empty; nothing has been recorded yet."
+                return "No footage is available yet."
             return json.dumps({
-                "oldest_seconds_ago": ago(rng[0]),
-                "newest_seconds_ago": ago(rng[1]),
-                "chat_available": self.chat is not None,
-                "live_transcript_available": self.transcriber is not None,
-                "signals_analyzed_up_to_seconds_ago": ago(self.signals.analyzed_until) if self.signals else None,
+                "footage_from": L(rng[0]),
+                "footage_to": L(rng[1]),
+                "times_are_in": tl.unit,
+                "chat_text_available": self.chat is not None,
+                "chat_panel_images_available": bool(self.recording and self.recording.chat),
+                "transcript_available": self.transcriber is not None,
             })
 
-        @beta_tool
-        def get_signals(from_seconds_ago: int, to_seconds_ago: int = 0) -> str:
+        def get_signals(from_t: float, to_t: float | None = None) -> str:
             """Timeline of everything the signal detector measured, in 5-second windows: chat speed and
-            reaction types (laughing, hype, shock, rage/fail, sad/wholesome, clip it), audio loudness,
-            visual change on screen, and what the streamer exclaimed. Each window has an interest score
-            and reasons. Use it to see how a moment built up, peaked and faded.
+            reaction types (laughing, hype, shock, rage/fail, sad/wholesome, clip it), on-screen chat
+            scrolling, audio loudness, visual change on screen, and what the streamer exclaimed. Each
+            window has an interest score and reasons. Use it to see how a moment built up, peaked and faded.
 
             Args:
-                from_seconds_ago: Start of the window, in seconds before now.
-                to_seconds_ago: End of the window, in seconds before now (0 = now).
+                from_t: Start of the range, in {unit}.
+                to_t: End of the range, in {unit}; {default_to}.
             """
             if not self.signals:
                 return "The signal detector is not running."
-            rows = []
-            for w in self.signals.timeline(ts(from_seconds_ago), ts(to_seconds_ago), now):
-                rows.append({"seconds_ago": ago(w.start), "score": w.score, "reasons": w.reasons, **w.features})
-            base = self.signals.baseline(now)
-            return json.dumps({"normal_for_this_stream": {k: round(v, 2) for k, v in base.items()}, "windows": rows})
+            a, b = sorted((T(from_t), T(to_t)))
+            rows = [{"at": L(w.start), "score": w.score, "reasons": w.reasons, **w.features}
+                    for w in self.signals.timeline(a, b, tl.now)]
+            base = self.signals.baseline(tl.now)
+            return json.dumps({"normal_for_this_stream": {k: round(v, 3) for k, v in base.items()},
+                               "windows": rows})
 
-        @beta_tool
-        def get_chat_activity(from_seconds_ago: int, to_seconds_ago: int = 0, bucket_seconds: int = 10) -> str:
+        def get_chat_activity(from_t: float, to_t: float | None = None, bucket_seconds: int = 10) -> str:
             """Chat message counts per time bucket, with the most repeated messages in each.
 
             Args:
-                from_seconds_ago: Start of the window, in seconds before now.
-                to_seconds_ago: End of the window, in seconds before now (0 = now).
+                from_t: Start of the range, in {unit}.
+                to_t: End of the range, in {unit}; {default_to}.
                 bucket_seconds: Width of each bucket in seconds.
             """
             if not self.chat:
-                return "No chat is connected for this stream."
-            rows = self.chat.buckets(ts(from_seconds_ago), ts(to_seconds_ago), max(bucket_seconds, 1))
+                return "Chat isn't available as text for this stream."
+            a, b = sorted((T(from_t), T(to_t)))
+            rows = self.chat.buckets(a, b, max(bucket_seconds, 1))
             for r in rows:
-                r["seconds_ago"] = ago(r.pop("start"))
+                r["at"] = L(r.pop("start"))
             return json.dumps(rows)
 
-        @beta_tool
-        def get_chat_messages(from_seconds_ago: int, to_seconds_ago: int = 0, limit: int = 80) -> str:
-            """Raw chat messages in a time window (sampled evenly if there are more than `limit`).
+        def get_chat_messages(from_t: float, to_t: float | None = None, limit: int = 80) -> str:
+            """Raw chat messages in a time range (sampled evenly if there are more than `limit`).
 
             Args:
-                from_seconds_ago: Start of the window, in seconds before now.
-                to_seconds_ago: End of the window, in seconds before now (0 = now).
+                from_t: Start of the range, in {unit}.
+                to_t: End of the range, in {unit}; {default_to}.
                 limit: Maximum number of messages to return.
             """
             if not self.chat:
-                return "No chat is connected for this stream."
-            msgs = self.chat.messages_between(ts(from_seconds_ago), ts(to_seconds_ago))
+                return "Chat isn't available as text for this stream."
+            a, b = sorted((T(from_t), T(to_t)))
+            msgs = self.chat.messages_between(a, b)
             if len(msgs) > limit > 0:
                 step = len(msgs) / limit
                 msgs = [msgs[int(i * step)] for i in range(limit)]
-            return "\n".join(f"[-{ago(m.ts)}s] {m.user}: {m.text}" for m in msgs) or "(no messages)"
+            return "\n".join(f"[{L(m.ts)}] {m.user}: {m.text}" for m in msgs) or "(no messages)"
 
-        @beta_tool
-        def get_transcript(from_seconds_ago: int, to_seconds_ago: int = 0) -> str:
-            """What the streamer said in a time window (live speech-to-text).
+        def get_transcript(from_t: float, to_t: float | None = None) -> str:
+            """What the streamer said in a time range (speech-to-text).
 
             Args:
-                from_seconds_ago: Start of the window, in seconds before now.
-                to_seconds_ago: End of the window, in seconds before now (0 = now).
+                from_t: Start of the range, in {unit}.
+                to_t: End of the range, in {unit}; {default_to}.
             """
             if not self.transcriber:
-                return "Live transcription is not enabled."
-            lines = self.transcriber.lines_between(ts(from_seconds_ago), ts(to_seconds_ago))
-            words = [Word(ln.start, ln.end, ln.text) for ln in lines]
+                return "Transcription is not enabled."
+            a, b = sorted((T(from_t), T(to_t)))
+            words = [Word(ln.start, ln.end, ln.text) for ln in self.transcriber.lines_between(a, b)]
             return "\n".join(
-                f"[-{ago(g[0].start)}s] {' '.join(w.text for w in g)}" for g in _group_words(words)
+                f"[{L(g[0].start)}] {' '.join(w.text for w in g)}" for g in _group_words(words)
             ) or "(no speech found)"
 
-        @beta_tool
-        def view_frames(from_seconds_ago: int, to_seconds_ago: int, count: int = 4):
+        def view_frames(from_t: float, to_t: float, count: int = 4):
             """Look at the video: returns `count` evenly spaced still frames (max 8) between two times.
             Use it to see what actually happened on screen: deaths, wins, jump scares, the streamer's
             face, whether a moment is understandable without context.
 
             Args:
-                from_seconds_ago: First frame, in seconds before now.
-                to_seconds_ago: Last frame, in seconds before now.
+                from_t: First frame, in {unit}.
+                to_t: Last frame, in {unit}.
                 count: How many frames to return (1-8).
             """
             count = min(max(count, 1), MAX_FRAMES)
-            a, b = sorted((ts(from_seconds_ago), ts(to_seconds_ago)))
+            a, b = sorted((T(from_t), T(to_t)))
             times = [a] if count == 1 else [a + (b - a) * i / (count - 1) for i in range(count)]
             blocks: list[dict] = []
             for t in times:
                 jpeg = grab_frame(self.recorder, t)
                 if jpeg:
-                    blocks.append({"type": "text", "text": f"Frame at -{ago(t)}s:"})
-                    blocks.append(image_block(jpeg))
-            return blocks or "No frames available for that range (outside the buffer)."
+                    blocks += [{"type": "text", "text": f"Frame at {L(t)}:"}, image_block(jpeg)]
+            return blocks or "No frames available for that range."
 
-        @beta_tool
+        def view_chat(at_t: float, count: int = 2, spacing_seconds: float = 4.0):
+            """Look at the chat panel from the screen recording to read what viewers were saying.
+            Returns `count` images (max 4) starting at `at_t`, `spacing_seconds` apart. Chat reacts a
+            few seconds after a moment, so look slightly after it.
+
+            Args:
+                at_t: Time of the first image, in {unit}.
+                count: How many images (1-4).
+                spacing_seconds: Seconds between images.
+            """
+            if not (self.recording and self.recording.chat):
+                return "No chat panel was found in this recording."
+            blocks: list[dict] = []
+            for i in range(min(max(count, 1), 4)):
+                t = T(at_t) + i * spacing_seconds
+                jpeg = self.recording.grab_chat_frame(t)
+                if jpeg:
+                    blocks += [{"type": "text", "text": f"Chat at {L(t)}:"}, image_block(jpeg)]
+            return blocks or "No chat images available for that time."
+
         def create_clip(
-            start_seconds_ago: int,
-            end_seconds_ago: int,
+            start_t: float,
+            end_t: float,
             category: Category,
             virality_score: int,
             title: str,
             hook: str,
             reason: str,
         ) -> str:
-            """Cut a clip from the recorded buffer. Boundaries are nudged to the nearest pause in speech
-            so the clip doesn't start or end mid-sentence. Returns the clip's id and real length, what
-            was said and how chat reacted (times in seconds from the start of the clip), and the sound
-            effects and music you can use. Call finish_clip next to edit and save it.
+            """Cut a clip. Boundaries are nudged to the nearest pause in speech so the clip doesn't
+            start or end mid-sentence. Returns the clip's id and real length, what was said and how
+            chat reacted (times in seconds from the start of the CLIP), and the sound effects and
+            music you can use. Call finish_clip next to edit and save it.
 
             Args:
-                start_seconds_ago: Where the clip starts, in seconds before now.
-                end_seconds_ago: Where the clip ends, in seconds before now. Must be smaller than start.
+                start_t: Where the clip starts, in {unit}.
+                end_t: Where the clip ends, in {unit}.
                 category: What kind of moment this is.
                 virality_score: Your overall 1-10 rating of how well this would do as a short.
                 title: Short title for the file.
@@ -341,7 +412,7 @@ class ClipAgent:
             if virality_score < self.cfg.min_score:
                 return (f"Not clipped: a score of {virality_score} is below the minimum of "
                         f"{self.cfg.min_score}. Only clip moments that clearly qualify.")
-            start, end = ts(start_seconds_ago), ts(end_seconds_ago)
+            start, end = sorted((T(start_t), T(end_t)))
             length = end - start
             if length < self.cfg.min_clip or length > self.cfg.max_clip:
                 return (f"Error: the clip is {length:.0f}s; it must be between "
@@ -350,8 +421,9 @@ class ClipAgent:
                 if c.start < end and start < c.end:
                     return f"Error: overlaps an existing clip ('{c.title}')."
             rng = self.recorder.available_range()
-            if not rng or start < rng[0] or end > rng[1] + 1:
-                return "Error: that range isn't in the buffer. Call get_buffer_info for the available range."
+            if not rng or start < rng[0] - 1 or end > rng[1] + 1:
+                return "Error: that range isn't in the footage. Call get_buffer_info for the available range."
+            start, end = max(start, rng[0]), min(end, rng[1])
 
             clip_id = f"c{len(self.clips) + 1}"
             try:
@@ -363,13 +435,14 @@ class ClipAgent:
             clip.edits = {"category": category, "virality_score": virality_score, "hook": hook}
             self.clips.append(clip)
             self._words[clip_id] = words
-            log.info("Cut %s (%.0fs, %s, %d/10): %s", clip_id, clip.duration, category, virality_score, title)
+            log.info("Cut %s (%.0fs at %s, %s, %d/10): %s",
+                     clip_id, clip.duration, L(start), category, virality_score, title)
 
             return json.dumps({
                 "clip_id": clip_id,
                 "duration_seconds": round(clip.duration, 1),
-                "actual_start_seconds_ago": ago(start),
-                "actual_end_seconds_ago": ago(end),
+                "actual_start": L(start),
+                "actual_end": L(end),
                 "speech": _speech_lines(words) if self.cfg.captions else "captions unavailable",
                 "chat_reactions": self._chat_in_clip(start, end),
                 "sound_effects_available": list(list_sounds(self.cfg.assets_dir / "sfx"))
@@ -379,7 +452,6 @@ class ClipAgent:
                 "next_step": "Call finish_clip with this clip_id to add captions, sound effects and music.",
             })
 
-        @beta_tool
         def finish_clip(
             clip_id: str,
             sound_effects: list[SoundEffectCue] = [],
@@ -414,13 +486,20 @@ class ClipAgent:
                 return f"Error rendering the clip: {exc}"
             return f"Saved {path.name} ({clip.duration:.0f}s) with {json.dumps(clip.edits)}."
 
-        prompt = self._briefing(trigger, now, ago)
+        tools = [get_buffer_info, get_signals, get_chat_activity, get_chat_messages, get_transcript,
+                 view_frames, create_clip, finish_clip]
+        if self.recording and self.recording.chat:
+            tools.insert(6, view_chat)
+        if self.recording:  # no text chat in recordings: don't offer tools that can only say so
+            tools = [t for t in tools if t not in (get_chat_activity, get_chat_messages)]
+        tools = [_tool(t, tl) for t in tools]
+
+        prompt = self._briefing(trigger, tl, focus)
         runner = self.client.beta.messages.tool_runner(
             model=MODEL,
             max_tokens=16000,
             system=[{"type": "text", "text": self.system_prompt, "cache_control": {"type": "ephemeral"}}],
-            tools=[get_buffer_info, get_signals, get_chat_activity, get_chat_messages, get_transcript,
-                   view_frames, create_clip, finish_clip],
+            tools=tools,
             messages=[{"role": "user", "content": prompt}],
             # Judging what's clip-worthy is the hard part; give it room to think.
             output_config={"effort": "high"},
@@ -467,7 +546,7 @@ class ClipAgent:
         else:
             abs_words = []
 
-        name = clip_basename(start, title, self.cfg.vertical)
+        name = self._clip_name(start, title)
         raw = work / f"{name}.raw.mp4"
         cut_clip(self.recorder, start, end, raw, self.cfg.vertical)
         words = [Word(w.start - start, w.end - start, w.text) for w in abs_words if w.start >= start and w.end <= end]
@@ -544,35 +623,44 @@ class ClipAgent:
             for r in rows if r["count"]
         ]
 
-    def _briefing(self, trigger: str, now: float, ago) -> str:
-        parts = [f"Trigger: {trigger}"]
+    def _briefing(self, trigger: str, tl: Timeline, focus: tuple[float, float] | None) -> str:
+        if focus is None:
+            focus = (tl.now - 300, tl.now)
+        parts = [f"Trigger: {trigger}", f"All times are in {tl.unit}."]
         if self.signals:
-            windows = self.signals.timeline(now - 300, now, now)
+            windows = self.signals.timeline(focus[0], focus[1], tl.now)
             hot = sorted((w for w in windows if w.score > 0), key=lambda w: w.score, reverse=True)[:6]
+            span = f"{tl.label(focus[0])} to {tl.label(focus[1])}"
             if hot:
-                parts.append("Most notable moments in the last 5 minutes (from the signal detector):\n" + "\n".join(
-                    f"- around -{ago(w.start)}s (score {w.score}): {'; '.join(w.reasons)}"
+                parts.append(f"Most notable windows from {span} (signal detector):\n" + "\n".join(
+                    f"- at {tl.label(w.start)} (score {w.score}): {'; '.join(w.reasons)}"
                     for w in sorted(hot, key=lambda w: w.start)
                 ))
             else:
-                parts.append("The signal detector found nothing unusual in the last 5 minutes.")
+                parts.append(f"The signal detector found nothing unusual from {span}.")
         if self.chat:
-            recent = self.chat.buckets(now - 300, now, 15)
-            parts.append(
-                "Chat messages per 15s over the last 5 minutes (oldest first): "
-                + ", ".join(str(r["count"]) for r in recent)
-            )
+            recent = self.chat.buckets(focus[0], focus[1], 15)
+            parts.append("Chat messages per 15s over that range (oldest first): "
+                         + ", ".join(str(r["count"]) for r in recent))
         if self.transcriber:
-            parts.append("A live transcript is available (get_transcript): check it for stories and hot takes too.")
-        recent_clips = [c for c in self.clips if now - c.end < 1800]
-        if recent_clips:
-            parts.append("Recent clips:\n" + "\n".join(
-                f"- '{c.title}' from -{ago(c.start)}s to -{ago(c.end)}s" for c in recent_clips
+            parts.append("A transcript is available (get_transcript): check it for stories and hot takes too.")
+        relevant = self.clips if self.recording else [c for c in self.clips if tl.now - c.end < 1800]
+        if relevant:
+            parts.append("Recent clips (don't overlap these):\n" + "\n".join(
+                f"- '{c.title}' from {tl.label(c.start)} to {tl.label(c.end)}" for c in relevant
             ))
         else:
             parts.append("Recent clips: none")
         parts.append("Investigate, decide whether anything here truly qualifies, and if so cut and edit it.")
         return "\n\n".join(parts)
+
+    def _clip_name(self, start: float, title: str) -> str:
+        suffix = "_vertical" if self.cfg.vertical else ""
+        if self.recording:
+            s = round(start - self.recording.virtual_start)
+            return f"{slugify(self.recording.path.stem, 30)}_{s // 60:02d}m{s % 60:02d}s_{slugify(title)}{suffix}"
+        stamp = datetime.fromtimestamp(start).strftime("%Y%m%d_%H%M%S")
+        return f"{stamp}_{slugify(title)}{suffix}"
 
     def _log_clip(self, clip: Clip) -> None:
         self.cfg.out_dir.mkdir(parents=True, exist_ok=True)

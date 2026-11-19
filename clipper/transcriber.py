@@ -39,6 +39,11 @@ class Transcriber:
             return None
         return cls(recorder, model_size)
 
+    def load_words(self, words: list[whisper.Word], timeline_start: float) -> None:
+        """Use a transcript made up front (recordings) instead of transcribing live."""
+        with self._lock:
+            self._lines = [TranscriptLine(timeline_start + w.start, timeline_start + w.end, w.text) for w in words]
+
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="transcriber").start()
 

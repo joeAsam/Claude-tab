@@ -24,6 +24,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .chat import TwitchChat
 from .recorder import Segment, StreamRecorder
@@ -86,6 +87,8 @@ class SignalMonitor:
         self.transcriber = transcriber
         self._loud: dict[float, float] = {}   # half-second timestamp -> RMS dB
         self._scene: dict[float, float] = {}  # half-second timestamp -> scene change score (0-1)
+        self._chat_scroll: dict[float, float] = {}  # half-second timestamp -> on-screen chat movement (recordings)
+        self.fixed_baseline: dict | None = None  # recordings: one "normal" for the whole file
         self._done: set[str] = set()
         self._analyzed_until = 0.0
         self._lock = threading.Lock()
@@ -116,6 +119,33 @@ class SignalMonitor:
                 self._analyzed_until = max(self._analyzed_until, seg.end)
             self._forget_old()
 
+    def analyze_all(self) -> None:
+        """Analyze every segment now (for recordings, where all footage already exists)."""
+        segs = self.recorder.segments()
+        for i, seg in enumerate(segs, 1):
+            if seg.path.name not in self._done:
+                try:
+                    self._analyze(seg)
+                except Exception as exc:
+                    log.debug("Signal analysis failed for %s: %s", seg.path.name, exc)
+                self._done.add(seg.path.name)
+                self._analyzed_until = max(self._analyzed_until, seg.end)
+            if i % max(len(segs) // 10, 1) == 0:
+                log.info("Analyzing audio and video: %d%%", round(i / len(segs) * 100))
+
+    def load_chat_scroll(self, video: Path, crop_filter: str, timeline_start: float) -> None:
+        """Measure how much the on-screen chat panel moves (a stand-in for chat speed when
+        chat is only visible in a screen recording, not readable as text)."""
+        log.info("Measuring on-screen chat activity...")
+        series = _metadata_series_path(
+            ["-an", "-vf", f"{crop_filter},fps=2,scale=200:-2,select='gte(scene\\,0)',"
+             "metadata=mode=print:key=lavfi.scene_score:file=-"],
+            video, "lavfi.scene_score", timeout=None,
+        )
+        with self._lock:
+            for t, v in series:
+                self._chat_scroll[round((timeline_start + t) * 2) / 2] = v
+
     def _analyze(self, seg: Segment) -> None:
         loud = _metadata_series(
             ["-vn", "-af", "aresample=16000,asetnsamples=n=8000,astats=metadata=1:reset=1,"
@@ -137,7 +167,7 @@ class SignalMonitor:
     def _forget_old(self) -> None:
         cutoff = time.time() - max(self.recorder.buffer_seconds, 900)
         with self._lock:
-            for series in (self._loud, self._scene):
+            for series in (self._loud, self._scene, self._chat_scroll):
                 for k in [k for k in series if k < cutoff]:
                     del series[k]
 
@@ -156,6 +186,9 @@ class SignalMonitor:
         scene = self._values(self._scene, start, end)
         if scene:
             f["visual_change"] = round(max(scene), 2)
+        scroll = self._values(self._chat_scroll, start, end)
+        if scroll:
+            f["chat_scroll"] = round(statistics.mean(scroll), 3)
         if self.chat:
             msgs = self.chat.messages_between(start, end)
             f["chat_msgs"] = len(msgs)
@@ -172,7 +205,14 @@ class SignalMonitor:
 
     def baseline(self, now: float, lookback: int = 600) -> dict:
         """What 'normal' looks like on this stream lately (excluding the last minute)."""
-        start, end = now - lookback, now - 60
+        if self.fixed_baseline is not None:
+            return self.fixed_baseline
+        return self.baseline_between(now - lookback, now - 60)
+
+    def use_whole_range_as_baseline(self, start: float, end: float) -> None:
+        self.fixed_baseline = self.baseline_between(start, end)
+
+    def baseline_between(self, start: float, end: float) -> dict:
         b: dict = {}
         loud = self._values(self._loud, start, end)
         if len(loud) >= 20:
@@ -181,6 +221,9 @@ class SignalMonitor:
         scene = self._values(self._scene, start, end)
         if len(scene) >= 20:
             b["visual_change"] = statistics.quantiles(scene, n=10)[-1]  # 90th percentile
+        scroll = self._values(self._chat_scroll, start, end)
+        if len(scroll) >= 20:
+            b["chat_scroll"] = max(statistics.median(scroll), 0.003)
         if self.chat:
             # Only count time we were actually listening, or early chat looks artificially quiet.
             listen_start = max(start, self.chat.listening_since or end)
@@ -208,6 +251,13 @@ class SignalMonitor:
             if reactions.get("clip it", 0) >= 2:
                 ws.score += 1.5
                 ws.reasons.append(f"{reactions['clip it']} viewers asking to clip it")
+
+        # On-screen chat (recordings): the chat panel scrolling much faster than usual.
+        if "chat_scroll" in f and "chat_scroll" in baseline:
+            ratio = f["chat_scroll"] / baseline["chat_scroll"]
+            if ratio >= 2.0:
+                ws.score += min((ratio - 1) * 0.7, 3.0)
+                ws.reasons.append(f"on-screen chat scrolling {ratio:.1f}x faster than normal")
 
         # Audio: sudden loudness = yelling, screaming, laughing hard, explosions.
         if "loudness_db" in f and "loudness_db" in baseline:
@@ -247,9 +297,15 @@ class SignalMonitor:
 
 
 def _metadata_series(args: list[str], seg: Segment, key: str) -> list[tuple[float, float]]:
+    return _metadata_series_path(args, seg.path, key)
+
+
+def _metadata_series_path(
+    args: list[str], path: Path, key: str, timeout: float | None = 60
+) -> list[tuple[float, float]]:
     out = subprocess.run(
-        ["ffmpeg", "-nostats", "-hide_banner", "-loglevel", "error", "-i", str(seg.path), *args, "-f", "null", "-"],
-        capture_output=True, text=True, timeout=60,
+        ["ffmpeg", "-nostats", "-hide_banner", "-loglevel", "error", "-i", str(path), *args, "-f", "null", "-"],
+        capture_output=True, text=True, timeout=timeout,
     ).stdout
     series, t = [], None
     for line in out.splitlines():

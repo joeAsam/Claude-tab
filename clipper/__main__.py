@@ -10,7 +10,13 @@ import sys
 import time
 from pathlib import Path
 
+import anthropic
+
+from . import whisper
 from .agent import ClipAgent, ClipAgentConfig
+from .clips import slugify
+from .filesource import Crop, FileSource, probe_video
+from .layout import Layout, detect_layout, save_preview
 from .chat import TwitchChat
 from .recorder import StreamRecorder
 from .signals import SignalMonitor
@@ -26,8 +32,10 @@ def twitch_channel(url: str) -> str | None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Watch a live stream and let Claude clip and edit the best moments.")
-    p.add_argument("url", help="Stream URL (Twitch, YouTube, Kick, ... anything streamlink supports)")
+    p = argparse.ArgumentParser(
+        description="Let Claude find, clip and edit the best moments of a live stream or a recording.")
+    p.add_argument("source", help="A live stream URL (Twitch, YouTube, Kick, ...) OR a video file, "
+                                  "such as a screen recording of a stream")
 
     g = p.add_argument_group("clips")
     g.add_argument("--out", type=Path, default=Path("clips"), help="Where to save clips")
@@ -48,7 +56,17 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--whisper-model", default="base",
                    help="faster-whisper model for captions: tiny, base, small, medium, large-v3")
 
-    g = p.add_argument_group("recording")
+    g = p.add_argument_group("video files / screen recordings")
+    g.add_argument("--max-clips", type=int, default=10, help="Stop after this many clips (default 10)")
+    g.add_argument("--max-reviews", type=int, default=15,
+                   help="Most candidate moments Claude reviews (each review costs API usage; default 15)")
+    g.add_argument("--crop", type=Crop.parse, metavar="W:H:X:Y",
+                   help="Where the stream player is in the recording, in pixels (default: found automatically)")
+    g.add_argument("--chat-crop", type=Crop.parse, metavar="W:H:X:Y",
+                   help="Where the chat panel is in the recording (default: found automatically)")
+    g.add_argument("--no-crop", action="store_true", help="The file is already just the stream: don't crop")
+
+    g = p.add_argument_group("live recording")
     g.add_argument("--buffer-dir", type=Path, default=Path("buffer"), help="Where to keep the rolling recording")
     g.add_argument("--buffer-minutes", type=int, default=15, help="How much recent video to keep")
     g.add_argument("--quality", default="best", help="streamlink quality, e.g. best, 720p60, 480p")
@@ -66,9 +84,6 @@ def parse_args() -> argparse.Namespace:
 
     if not 1 <= args.min_clip <= args.max_clip:
         p.error("--min-clip must be at least 1 and no more than --max-clip")
-    if args.buffer_minutes * 60 < args.max_clip + 120:
-        args.buffer_minutes = (args.max_clip + 120 + 59) // 60
-        print(f"Raised --buffer-minutes to {args.buffer_minutes} to fit {args.max_clip}s clips.")
     return args
 
 
@@ -79,25 +94,22 @@ def main() -> int:
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
-    for tool in ("ffmpeg", "ffprobe", "streamlink"):
+    if Path(args.source).is_file():
+        return run_file(args)
+    return run_live(args)
+
+
+def setup(args) -> bool:
+    for tool in ("ffmpeg", "ffprobe") + (() if Path(args.source).is_file() else ("streamlink",)):
         if not shutil.which(tool):
             log.error("%s is not installed or not on PATH.", tool)
-            return 1
-
+            return False
     ensure_default_assets(args.assets)
+    return True
 
-    recorder = StreamRecorder(args.url, args.buffer_dir, buffer_minutes=args.buffer_minutes, quality=args.quality)
-    channel = twitch_channel(args.url)
-    chat = TwitchChat(channel) if channel else None
-    transcriber = None if args.no_transcribe else Transcriber.try_create(recorder, args.whisper_model)
-    signals = SignalMonitor(recorder, chat, transcriber)
 
-    if not chat and not args.review_minutes:
-        log.info("No chat reader for this platform: detecting moments from audio, video and speech, "
-                 "plus a review every 5 minutes for anything subtler.")
-        args.review_minutes = 5
-
-    agent = ClipAgent(recorder, chat, transcriber, signals, ClipAgentConfig(
+def agent_config(args) -> ClipAgentConfig:
+    return ClipAgentConfig(
         out_dir=args.out,
         assets_dir=args.assets,
         vertical=args.vertical,
@@ -110,7 +122,134 @@ def main() -> int:
         music=not args.no_music,
         hook=not args.no_hook,
         fixed_hook=args.hook,
-    ))
+    )
+
+
+# ---- video files / screen recordings ----------------------------------------
+
+def run_file(args) -> int:
+    if not setup(args):
+        return 1
+    path = Path(args.source)
+    info = probe_video(path)
+    log.info("Recording: %s, %dx%d, %.1f minutes", path.name, info["width"], info["height"], info["duration"] / 60)
+    if info["duration"] < args.min_clip:
+        log.error("The recording is shorter than --min-clip (%ds).", args.min_clip)
+        return 1
+
+    # 1. Find the stream player and the chat panel in the recording.
+    work = args.buffer_dir / slugify(path.stem, 40)
+    work.mkdir(parents=True, exist_ok=True)
+    if args.no_crop:
+        layout = Layout(None, args.chat_crop)
+    elif args.crop:
+        layout = Layout(args.crop, args.chat_crop)
+    else:
+        log.info("Finding the stream player and chat in the recording...")
+        layout = detect_layout(anthropic.Anthropic(), path, info["width"], info["height"], info["duration"])
+        if args.chat_crop:
+            layout.chat = args.chat_crop
+    preview = save_preview(path, info["duration"] * 0.3, layout, work / "layout_preview.jpg")
+    log.info("Player crop: %s | chat panel: %s | check: %s",
+             layout.player or "full frame", layout.chat or "not found", preview)
+    if layout.notes:
+        log.info("Layout notes: %s", layout.notes)
+
+    # 2. Crop and split the recording, transcribe it, and measure every signal.
+    source = FileSource(path, work, info["duration"], layout.player, layout.chat)
+    source.prepare()
+    transcriber = None
+    if not args.no_transcribe and whisper.available():
+        log.info("Transcribing the whole recording (the first run downloads the speech model)...")
+        transcriber = Transcriber(source, args.whisper_model)
+        transcriber.load_words(whisper.transcribe_words(path, args.whisper_model), source.virtual_start)
+    signals = SignalMonitor(source, None, transcriber)
+    if layout.chat:
+        signals.load_chat_scroll(path, layout.chat.filter, source.virtual_start)
+    signals.analyze_all()
+    start, end = source.available_range()
+    signals.use_whole_range_as_baseline(start, end)
+
+    # 3. Rank the moments, then let Claude review the best ones.
+    agent = ClipAgent(source, None, transcriber, signals, agent_config(args), recording=source)
+    candidates = pick_candidates(signals, start, end, args.sensitivity, spacing=args.min_clip)
+    log.info("Found %d candidate moments above sensitivity %.1f", len(candidates), args.sensitivity)
+
+    def finished() -> int:
+        return sum(1 for c in agent.clips if c.path)
+
+    reviews = 0
+    for w in candidates:
+        if finished() >= args.max_clips or reviews >= args.max_reviews:
+            break
+        if any(c.start - 10 <= w.start <= c.end + 10 for c in agent.clips):
+            continue  # already covered by a clip
+        label = _mmss(w.start - start)
+        log.info("Reviewing candidate at %s (score %.1f): %s", label, w.score, "; ".join(w.reasons))
+        reviews += 1
+        try:
+            agent.review(
+                f"candidate moment at {label} = {round(w.start - start)}s (score {w.score}): {'; '.join(w.reasons)}",
+                focus=(max(start, w.start - 120), min(end, w.start + 90)),
+            )
+        except Exception:
+            log.exception("Review failed; moving on")
+
+    # 4. A last pass over the transcript for stories and hot takes the signals can't hear.
+    if transcriber and finished() < args.max_clips and reviews < args.max_reviews:
+        log.info("Final pass: reading the whole transcript for stories, hot takes and quieter gems...")
+        try:
+            agent.review(
+                "final pass over the whole recording. Read the full transcript (get_transcript from 0) "
+                "and look for great moments the loudness/chat signals may have missed: gripping "
+                "stories, hot takes, funny exchanges, intriguing or unique moments. Clip any that "
+                f"qualify (up to {args.max_clips - finished()} more), without overlapping existing clips.",
+                focus=(start, end),
+            )
+        except Exception:
+            log.exception("Final pass failed")
+
+    log.info("Done: %d clip(s) in %s/", finished(), args.out)
+    return 0
+
+
+def pick_candidates(signals: SignalMonitor, start: float, end: float, threshold: float, spacing: float):
+    """Highest-scoring windows, at least `spacing` seconds apart."""
+    windows = sorted((w for w in signals.timeline(start, end) if w.score >= threshold),
+                     key=lambda w: w.score, reverse=True)
+    picked = []
+    for w in windows:
+        if all(abs(w.start - p.start) >= spacing for p in picked):
+            picked.append(w)
+    return picked
+
+
+def _mmss(seconds: float) -> str:
+    s = round(seconds)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+# ---- live streams ------------------------------------------------------------
+
+def run_live(args) -> int:
+    if not setup(args):
+        return 1
+    if args.buffer_minutes * 60 < args.max_clip + 120:
+        args.buffer_minutes = (args.max_clip + 120 + 59) // 60
+        log.info("Raised --buffer-minutes to %d to fit %ds clips.", args.buffer_minutes, args.max_clip)
+
+    recorder = StreamRecorder(args.source, args.buffer_dir, buffer_minutes=args.buffer_minutes, quality=args.quality)
+    channel = twitch_channel(args.source)
+    chat = TwitchChat(channel) if channel else None
+    transcriber = None if args.no_transcribe else Transcriber.try_create(recorder, args.whisper_model)
+    signals = SignalMonitor(recorder, chat, transcriber)
+
+    if not chat and not args.review_minutes:
+        log.info("No chat reader for this platform: detecting moments from audio, video and speech, "
+                 "plus a review every 5 minutes for anything subtler.")
+        args.review_minutes = 5
+
+    agent = ClipAgent(recorder, chat, transcriber, signals, agent_config(args))
 
     recorder.start()
     signals.start()
@@ -120,7 +259,7 @@ def main() -> int:
         transcriber.start()
 
     log.info("Watching %s. Clips (%d-%ds) go to %s/. Press Ctrl+C to stop.",
-             args.url, args.min_clip, args.max_clip, args.out)
+             args.source, args.min_clip, args.max_clip, args.out)
     last_review = time.time()
     try:
         while True:
