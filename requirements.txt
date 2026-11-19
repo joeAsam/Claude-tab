@@ -1,4 +1,4 @@
 anthropic>=2.10
 streamlink>=8.0
-# Optional: speech transcription so the agent can "hear" the stream.
-# faster-whisper>=1.0
+faster-whisper>=1.0   # captions (word-level speech timing)
+numpy>=1.26           # synthesizes the starter sound effects and music

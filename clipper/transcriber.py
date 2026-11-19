@@ -1,6 +1,7 @@
-"""Optional speech-to-text for buffered segments, using faster-whisper.
+"""Optional live speech-to-text for buffered segments, using faster-whisper.
 
-If faster-whisper isn't installed, the agent works from chat activity alone.
+This lets the agent read what the streamer said when deciding what to clip.
+(Captions are made separately, from each finished clip.)
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ import logging
 import threading
 from dataclasses import dataclass
 
+from . import whisper
 from .recorder import Segment, StreamRecorder
 
 log = logging.getLogger(__name__)
@@ -23,10 +25,8 @@ class TranscriptLine:
 
 class Transcriber:
     def __init__(self, recorder: StreamRecorder, model_size: str = "base") -> None:
-        from faster_whisper import WhisperModel  # imported lazily: optional dependency
-
         self.recorder = recorder
-        self.model = WhisperModel(model_size, device="auto", compute_type="int8")
+        self.model_size = model_size
         self._lines: list[TranscriptLine] = []
         self._done: set[str] = set()
         self._lock = threading.Lock()
@@ -34,11 +34,10 @@ class Transcriber:
 
     @classmethod
     def try_create(cls, recorder: StreamRecorder, model_size: str) -> "Transcriber | None":
-        try:
-            return cls(recorder, model_size)
-        except ImportError:
-            log.info("faster-whisper not installed; running without transcripts")
+        if not whisper.available():
+            log.warning("faster-whisper not installed; running without live transcripts")
             return None
+        return cls(recorder, model_size)
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="transcriber").start()
@@ -56,11 +55,11 @@ class Transcriber:
 
     def _transcribe(self, seg: Segment) -> None:
         try:
-            parts, _ = self.model.transcribe(str(seg.path), vad_filter=True)
-            lines = [TranscriptLine(seg.start + p.start, seg.start + p.end, p.text.strip()) for p in parts]
+            words = whisper.transcribe_words(seg.path, self.model_size)
         except Exception as exc:  # a corrupt or deleted segment shouldn't kill the thread
             log.debug("Transcription failed for %s: %s", seg.path.name, exc)
             return
+        lines = [TranscriptLine(seg.start + w.start, seg.start + w.end, w.text) for w in words]
         with self._lock:
             self._lines.extend(lines)
             cutoff = seg.start - self.recorder.buffer_seconds
