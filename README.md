@@ -30,6 +30,22 @@ Twitch chat ──────────────── speed + reaction ty
 
    Each finished clip is logged to `clips/clips.jsonl` with its edits.
 
+## Clipping a past stream (VOD)
+
+Download a past stream and clip it in one command:
+
+```bash
+# First hour of a YouTube stream (video + chat replay), vertical clips
+python -m clipper "https://youtu.be/VIDEO_ID" --first 60 --vertical
+
+# The whole VOD
+python -m clipper "https://youtu.be/VIDEO_ID" --vod
+```
+
+The video goes to `downloads/`. For YouTube streams the **live chat replay** is downloaded too, so the clipper gets real chat reactions with timestamps (laughing, W/L, "clip it", channel emotes like `_kaiLUL` read as LUL), exactly as on a live stream. It then runs like recording mode below. A replay saved next to any video file as `<name>.live_chat.json` is picked up automatically, or pass one with `--chat-replay`.
+
+yt-dlp needs a JavaScript runtime for YouTube (install [Deno](https://deno.com), or Node and add `--js-runtimes node` to a yt-dlp config file). YouTube sometimes blocks downloads from cloud servers ("Sign in to confirm you're not a bot"); from a home connection it normally works.
+
 ## Clipping a recording (e.g. a screen recording)
 
 Pass a video file instead of a link:
@@ -121,6 +137,7 @@ Set `CLIPPER_MODEL` to use a different Claude model (default `claude-opus-5-5`).
 | `clipper/frames.py` | Grabs still frames so Claude can see the video |
 | `clipper/filesource.py` | Recording mode: crops a video file to the player and splits it like a live buffer |
 | `clipper/layout.py` | Finds the stream player and chat panel in a screen recording |
+| `clipper/download.py` | Downloads past streams (VODs) and their chat replays with yt-dlp |
 | `clipper/transcriber.py` | Live faster-whisper transcription of segments |
 | `clipper/clips.py` | Cuts clips out of the buffer with ffmpeg |
 | `clipper/whisper.py` | Shared Whisper model, word-level timestamps |

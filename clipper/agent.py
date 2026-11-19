@@ -152,6 +152,11 @@ SOURCE_NOTES = {
         "how fast chat was moving, and view_chat shows you the chat panel itself so you can read "
         "how viewers reacted (if the recording shows chat)."
     ),
+    "recording_with_chat": (
+        "You are working on a RECORDING of a stream. All times you give and receive are in seconds "
+        "from the start of the recording. The stream's chat replay is loaded, so chat tools work "
+        "exactly as on a live stream, with messages at the times viewers sent them."
+    ),
 }
 
 
@@ -239,7 +244,9 @@ class ClipAgent:
             min_clip=config.min_clip,
             max_clip=config.max_clip,
             min_score=config.min_score,
-            source_note=SOURCE_NOTES["recording" if recording else "live"],
+            source_note=SOURCE_NOTES[
+                ("recording_with_chat" if chat else "recording") if recording else "live"
+            ],
             edit_note=self._edit_note(),
         )
 
@@ -490,7 +497,7 @@ class ClipAgent:
                  view_frames, create_clip, finish_clip]
         if self.recording and self.recording.chat:
             tools.insert(6, view_chat)
-        if self.recording:  # no text chat in recordings: don't offer tools that can only say so
+        if not self.chat:  # no text chat: don't offer tools that can only say so
             tools = [t for t in tools if t not in (get_chat_activity, get_chat_messages)]
         tools = [_tool(t, tl) for t in tools]
 

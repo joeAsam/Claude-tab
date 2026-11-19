@@ -106,3 +106,62 @@ class TwitchChat:
             out.append({"start": t, "count": len(msgs), "top": [f"{txt} x{n}" for txt, n in common]})
             t += bucket_seconds
         return out
+
+
+class ReplayChat(TwitchChat):
+    """Chat from a saved replay (e.g. a YouTube live chat replay) on the clip timeline.
+    Offers the same queries as live Twitch chat, so the rest of the clipper can't tell
+    the difference."""
+
+    def __init__(self, messages: list[ChatMessage], timeline_start: float) -> None:
+        super().__init__("replay", keep_seconds=10**9)
+        self._messages = deque(sorted(messages, key=lambda m: m.ts))
+        self.listening_since = timeline_start
+
+    def start(self) -> None:  # nothing to connect to
+        pass
+
+
+def load_youtube_live_chat(path, timeline_start: float, max_seconds: float | None = None) -> ReplayChat:
+    """Parse yt-dlp's <video>.live_chat.json (one JSON object per line)."""
+    import json
+
+    messages = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            replay = entry.get("replayChatItemAction", {})
+            offset_ms = replay.get("videoOffsetTimeMsec", entry.get("videoOffsetTimeMsec"))
+            if offset_ms is None:
+                continue
+            offset = int(offset_ms) / 1000
+            if offset < 0 or (max_seconds is not None and offset > max_seconds):
+                continue
+            for action in replay.get("actions", []):
+                item = action.get("addChatItemAction", {}).get("item", {})
+                renderer = item.get("liveChatTextMessageRenderer") or item.get("liveChatPaidMessageRenderer")
+                if not renderer:
+                    continue
+                text = "".join(_run_text(run) for run in renderer.get("message", {}).get("runs", []))
+                if not text.strip():
+                    continue
+                user = renderer.get("authorName", {}).get("simpleText", "viewer").lstrip("@")
+                messages.append(ChatMessage(timeline_start + offset, user, text.strip()))
+    log.info("Loaded %d chat replay messages", len(messages))
+    return ReplayChat(messages, timeline_start)
+
+
+def _run_text(run: dict) -> str:
+    if "text" in run:
+        return run["text"]
+    emoji = run.get("emoji", {})
+    if not emoji:
+        return ""
+    if not emoji.get("isCustomEmoji") and emoji.get("emojiId"):
+        return emoji["emojiId"]  # standard emoji: the id is the character itself, e.g. 😂
+    shortcut = (emoji.get("shortcuts") or [""])[0].strip(":")
+    # Channel emotes look like "_kaiLUL"; keep the readable part so "LUL", "W" etc. still register.
+    return " " + re.sub(r"^_?[a-z0-9]+(?=[A-Z])", "", shortcut.lstrip("_")) + " "

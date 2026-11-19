@@ -17,7 +17,8 @@ from .agent import ClipAgent, ClipAgentConfig
 from .clips import slugify
 from .filesource import Crop, FileSource, probe_video
 from .layout import Layout, detect_layout, save_preview
-from .chat import TwitchChat
+from .chat import TwitchChat, load_youtube_live_chat
+from .download import download_vod
 from .recorder import StreamRecorder
 from .signals import SignalMonitor
 from .sounds import ensure_default_assets
@@ -65,6 +66,15 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--chat-crop", type=Crop.parse, metavar="W:H:X:Y",
                    help="Where the chat panel is in the recording (default: found automatically)")
     g.add_argument("--no-crop", action="store_true", help="The file is already just the stream: don't crop")
+    g.add_argument("--chat-replay", type=Path, metavar="FILE",
+                   help="YouTube chat replay (.live_chat.json from yt-dlp). Found automatically next to the video")
+
+    g = p.add_argument_group("past streams (VODs)")
+    g.add_argument("--vod", action="store_true",
+                   help="The URL is a past stream: download it (plus its chat replay) and clip it")
+    g.add_argument("--first", type=float, metavar="MINUTES",
+                   help="Only download and clip the first N minutes of a past stream (implies --vod)")
+    g.add_argument("--downloads", type=Path, default=Path("downloads"), help="Where downloaded streams go")
 
     g = p.add_argument_group("live recording")
     g.add_argument("--buffer-dir", type=Path, default=Path("buffer"), help="Where to keep the rolling recording")
@@ -95,6 +105,18 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
     if Path(args.source).is_file():
+        return run_file(args)
+    if args.vod or args.first:
+        try:
+            video, chat = download_vod(args.source, args.downloads, args.first)
+        except Exception as exc:
+            log.error("Download failed: %s", exc)
+            return 1
+        args.source = str(video)
+        if chat and not args.chat_replay:
+            args.chat_replay = chat
+        if not (args.crop or args.chat_crop):
+            args.no_crop = True  # a download is already just the stream
         return run_file(args)
     return run_live(args)
 
@@ -158,12 +180,19 @@ def run_file(args) -> int:
     # 2. Crop and split the recording, transcribe it, and measure every signal.
     source = FileSource(path, work, info["duration"], layout.player, layout.chat)
     source.prepare()
+    chat = None
+    replay = args.chat_replay or next(
+        (p for p in (path.with_suffix(".live_chat.json"), path.parent / f"{path.stem}.live_chat.json") if p.exists()),
+        None,
+    )
+    if replay:
+        chat = load_youtube_live_chat(replay, source.virtual_start, max_seconds=info["duration"])
     transcriber = None
     if not args.no_transcribe and whisper.available():
         log.info("Transcribing the whole recording (the first run downloads the speech model)...")
         transcriber = Transcriber(source, args.whisper_model)
         transcriber.load_words(whisper.transcribe_words(path, args.whisper_model), source.virtual_start)
-    signals = SignalMonitor(source, None, transcriber)
+    signals = SignalMonitor(source, chat, transcriber)
     if layout.chat:
         signals.load_chat_scroll(path, layout.chat.filter, source.virtual_start)
     signals.analyze_all()
@@ -171,7 +200,7 @@ def run_file(args) -> int:
     signals.use_whole_range_as_baseline(start, end)
 
     # 3. Rank the moments, then let Claude review the best ones.
-    agent = ClipAgent(source, None, transcriber, signals, agent_config(args), recording=source)
+    agent = ClipAgent(source, chat, transcriber, signals, agent_config(args), recording=source)
     candidates = pick_candidates(signals, start, end, args.sensitivity, spacing=args.min_clip)
     log.info("Found %d candidate moments above sensitivity %.1f", len(candidates), args.sensitivity)
 

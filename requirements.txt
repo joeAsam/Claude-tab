@@ -1,4 +1,5 @@
 anthropic>=2.10
 streamlink>=8.0
+yt-dlp[default]>=2026.10   # downloading past streams (VODs) and their chat replays
 faster-whisper>=1.0   # captions (word-level speech timing)
 numpy>=1.26           # synthesizes the starter sound effects and music
