@@ -23,6 +23,8 @@ import argparse
 import json
 import logging
 import os
+import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -33,6 +35,7 @@ log = logging.getLogger(__name__)
 
 BUFFER_API = "https://api.buffer.com"
 YOUTUBE_TITLE_MAX = 100
+YOUTUBE_SHORTS_MAX_SECONDS = 180
 
 
 class PublishError(RuntimeError):
@@ -119,8 +122,10 @@ class BufferClient:
         if due_at:
             post_input["dueAt"] = due_at
         if channel["service"] == "youtube":
+            if "#shorts" not in text.lower():
+                post_input["text"] = f"{text} #Shorts"
             post_input["metadata"] = {"youtube": {
-                "title": (youtube_title or text.split("\n")[0])[:YOUTUBE_TITLE_MAX],
+                "title": youtube_title_from(youtube_title or text),
                 "categoryId": youtube_category,
                 "privacy": "public",
                 "madeForKids": False,
@@ -177,6 +182,30 @@ class PostPlan:
     title: str
 
 
+def youtube_title_from(caption: str) -> str:
+    """A YouTube title from a caption: first line, hashtags removed, at most 100 characters."""
+    line = next((ln for ln in caption.splitlines() if ln.strip()), caption)
+    title = re.sub(r"\s*#[\w-]+", "", line).strip() or line.strip()
+    if len(title) > YOUTUBE_TITLE_MAX:
+        title = title[: YOUTUBE_TITLE_MAX - 1].rsplit(" ", 1)[0] + "…"
+    return title
+
+
+def _clip_shape(path: Path) -> tuple[float, bool] | None:
+    """(duration in seconds, is vertical), or None if ffprobe can't read it."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=width,height:format=duration", "-of", "json", str(path)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        info = json.loads(out)
+        stream = info["streams"][0]
+        return float(info["format"]["duration"]), stream["height"] > stream["width"]
+    except Exception:
+        return None
+
+
 def default_caption(title: str, hook: str | None) -> str:
     return (hook or title).strip()
 
@@ -216,11 +245,17 @@ class Publisher:
                 log.info("[dry run] would queue %s on %s (%s): %r", plan.path.name, c["name"], c["service"],
                          plan.caption[:80])
             return []
+        if any(c["service"] == "youtube" for c in todo):
+            shape = _clip_shape(plan.path)
+            if shape and (shape[0] > YOUTUBE_SHORTS_MAX_SECONDS or not shape[1]):
+                log.warning("%s is %s and %.0fs long, so YouTube will post it as a regular video, not a Short "
+                            "(Shorts must be vertical and at most %ds).", plan.path.name,
+                            "vertical" if shape[1] else "horizontal", shape[0], YOUTUBE_SHORTS_MAX_SECONDS)
         log.info("Uploading %s to Cloudinary...", plan.path.name)
         url = upload_video(plan.path)
         results = []
         for c in todo:
-            post = self.client.queue_video(c, url, plan.caption, youtube_title=plan.title,
+            post = self.client.queue_video(c, url, plan.caption, youtube_title=youtube_title_from(plan.caption),
                                            youtube_category=self.youtube_category)
             log.info("Queued %s on %s (%s) for %s", plan.path.name, c["name"], c["service"], post.get("dueAt"))
             row = {"clip": plan.path.name, "channel_id": c["id"], "channel": c["name"],
@@ -255,7 +290,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Queue finished clips on your Buffer channels.")
     p.add_argument("clips", nargs="*", type=Path, help="Clip files (default: every unposted clip in --clips-dir)")
     p.add_argument("--clips-dir", type=Path, default=Path("clips"))
-    p.add_argument("--channels", default="tiktok",
+    p.add_argument("--channels", default="tiktok,youtube",
                    help="Comma-separated Buffer channels: service (tiktok, youtube), channel name or ID")
     p.add_argument("--caption", help="Caption to use (default: the one Claude wrote for each clip)")
     p.add_argument("--youtube-category", default="20", help="YouTube category ID (20 = Gaming, 24 = Entertainment)")

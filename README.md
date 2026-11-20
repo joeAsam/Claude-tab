@@ -79,17 +79,17 @@ One-time setup:
 3. Buffer has no upload: it fetches each video from a public link when the post goes out. Create a free [Cloudinary](https://cloudinary.com) account and set `CLOUDINARY_URL` to the "API environment variable" shown on its dashboard.
 
 ```bash
-# Clip a stream and queue every finished clip on TikTok
+# Clip a stream and queue every finished clip on TikTok and YouTube Shorts
 python -m clipper https://twitch.tv/somechannel --vertical --post-to-buffer
 
-# Post to TikTok and YouTube Shorts (YouTube category 20 = Gaming)
-python -m clipper my_recording.mp4 --vertical --post-to-buffer --buffer-channels tiktok,youtube
+# TikTok only
+python -m clipper my_recording.mp4 --vertical --post-to-buffer --buffer-channels tiktok
 
 # Queue clips you already made (skips ones already queued; --dry-run to preview)
-python -m clipper.publish --channels tiktok
+python -m clipper.publish
 ```
 
-Claude writes a posting caption for every clip (one punchy line plus hashtags, kept in `clips/clips.jsonl`). Queued posts are logged in `clips/posted.jsonl` so nothing is posted twice. Channels can be named by service (`tiktok`, `youtube`), channel name or ID.
+Claude writes a posting caption for every clip (one punchy line plus hashtags, kept in `clips/clips.jsonl`). On YouTube the caption becomes the description (with `#Shorts` added) and its first line, without hashtags, becomes the title; category 20 (Gaming) by default, change it with `--youtube-category`. YouTube only counts **vertical clips of 3 minutes or less** as Shorts, so use `--vertical` and keep `--max-clip 180` when posting there; longer or horizontal clips are posted as regular videos (the clipper warns when that happens). Queued posts are logged in `clips/posted.jsonl` so nothing is posted twice. Channels can be named by service (`tiktok`, `youtube`), channel name or ID.
 
 ## Sound effects and music
 

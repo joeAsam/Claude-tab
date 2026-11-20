@@ -60,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     g = p.add_argument_group("posting (Buffer)")
     g.add_argument("--post-to-buffer", action="store_true",
                    help="Queue each finished clip on your Buffer channels (needs BUFFER_API_KEY and CLOUDINARY_URL)")
-    g.add_argument("--buffer-channels", default="tiktok",
-                   help="Comma-separated Buffer channels to post to: service, name or ID (default: tiktok)")
+    g.add_argument("--buffer-channels", default="tiktok,youtube",
+                   help="Comma-separated Buffer channels to post to: service, name or ID (default: tiktok,youtube)")
     g.add_argument("--youtube-category", default="20", help="YouTube category ID for Shorts (20 = Gaming)")
 
     g = p.add_argument_group("video files / screen recordings")
