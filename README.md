@@ -91,6 +91,23 @@ python -m clipper.publish
 
 Claude writes a posting caption for every clip (one punchy line plus hashtags, kept in `clips/clips.jsonl`). On YouTube the caption becomes the description (with `#Shorts` added) and its first line, without hashtags, becomes the title; category 20 (Gaming) by default, change it with `--youtube-category`. YouTube only counts **vertical clips of 3 minutes or less** as Shorts, so use `--vertical` and keep `--max-clip 180` when posting there; longer or horizontal clips are posted as regular videos (the clipper warns when that happens). Queued posts are logged in `clips/posted.jsonl` so nothing is posted twice. Channels can be named by service (`tiktok`, `youtube`), channel name or ID.
 
+## Auto-posting SupoClip clips
+
+If you make clips with [SupoClip](https://github.com/FujiwaraChoki/supoclip), run this on the same computer. Every 2 minutes it asks SupoClip for finished clips, and for each new one: downloads it as a 1080×1920 export, has Claude write the caption and YouTube title (from SupoClip's hook title, transcript and reasoning), uploads it to Cloudinary and adds it to your Buffer queues. Buffer posts one per daily slot, so one video's worth of clips keeps you posting for days. Best clips (SupoClip's virality score) are queued first, and nothing is posted twice.
+
+```bash
+export SUPOCLIP_API_KEY=sk_...        # SupoClip app → Agents & API
+export BUFFER_API_KEY=...             # Buffer → Settings → API
+export CLOUDINARY_URL=cloudinary://...
+export ANTHROPIC_API_KEY=sk-ant-...   # optional: Claude-written captions
+
+python -m clipper.supoclip --dry-run          # preview what would be posted
+python -m clipper.supoclip                    # keep watching (leave it running)
+python -m clipper.supoclip --min-virality 60  # only post clips SupoClip scored 60+/100
+```
+
+The first run only remembers clips that already exist (so an old backlog doesn't flood your queues); add `--backlog` to post those too. `SUPOCLIP_API_URL` defaults to `http://localhost:8000` (SupoClip's backend in its Docker setup). To run it without a terminal open, schedule `python -m clipper.supoclip --once` every few minutes (Windows Task Scheduler, macOS launchd, or cron).
+
 ## Sound effects and music
 
 On first run, a starter library of royalty-free sounds is synthesized into `assets/`:
@@ -161,6 +178,7 @@ Set `CLIPPER_MODEL` to use a different Claude model (default `claude-opus-5-5`).
 | `clipper/layout.py` | Finds the stream player and chat panel in a screen recording |
 | `clipper/download.py` | Downloads past streams (VODs) and their chat replays with yt-dlp |
 | `clipper/publish.py` | Uploads clips to Cloudinary and queues them on Buffer (also a standalone command) |
+| `clipper/supoclip.py` | Watches SupoClip for finished clips and auto-posts them through Buffer |
 | `clipper/transcriber.py` | Live faster-whisper transcription of segments |
 | `clipper/clips.py` | Cuts clips out of the buffer with ffmpeg |
 | `clipper/whisper.py` | Shared Whisper model, word-level timestamps |
