@@ -69,6 +69,28 @@ python -m clipper my_screen_recording.mp4 --vertical
 
 Tips: record at 1080p if you can (clips can only be as sharp as the recording), and turn off notifications while recording, since anything inside the stream player ends up in the clips.
 
+## Posting daily through Buffer
+
+Finished clips can go straight into your [Buffer](https://buffer.com) queue. Buffer then posts them at your posting-schedule times, so **one slot a day in each channel's Posting Schedule = one post a day**.
+
+One-time setup:
+1. In Buffer, connect your channels (Channels → Connect a channel) and give each one a posting time for **every** day of the week (channel → Settings → Posting Schedule).
+2. Create a Buffer API key (Settings → API) and set it as `BUFFER_API_KEY`.
+3. Buffer has no upload: it fetches each video from a public link when the post goes out. Create a free [Cloudinary](https://cloudinary.com) account and set `CLOUDINARY_URL` to the "API environment variable" shown on its dashboard.
+
+```bash
+# Clip a stream and queue every finished clip on TikTok
+python -m clipper https://twitch.tv/somechannel --vertical --post-to-buffer
+
+# Post to TikTok and YouTube Shorts (YouTube category 20 = Gaming)
+python -m clipper my_recording.mp4 --vertical --post-to-buffer --buffer-channels tiktok,youtube
+
+# Queue clips you already made (skips ones already queued; --dry-run to preview)
+python -m clipper.publish --channels tiktok
+```
+
+Claude writes a posting caption for every clip (one punchy line plus hashtags, kept in `clips/clips.jsonl`). Queued posts are logged in `clips/posted.jsonl` so nothing is posted twice. Channels can be named by service (`tiktok`, `youtube`), channel name or ID.
+
 ## Sound effects and music
 
 On first run, a starter library of royalty-free sounds is synthesized into `assets/`:
@@ -138,6 +160,7 @@ Set `CLIPPER_MODEL` to use a different Claude model (default `claude-opus-5-5`).
 | `clipper/filesource.py` | Recording mode: crops a video file to the player and splits it like a live buffer |
 | `clipper/layout.py` | Finds the stream player and chat panel in a screen recording |
 | `clipper/download.py` | Downloads past streams (VODs) and their chat replays with yt-dlp |
+| `clipper/publish.py` | Uploads clips to Cloudinary and queues them on Buffer (also a standalone command) |
 | `clipper/transcriber.py` | Live faster-whisper transcription of segments |
 | `clipper/clips.py` | Cuts clips out of the buffer with ffmpeg |
 | `clipper/whisper.py` | Shared Whisper model, word-level timestamps |

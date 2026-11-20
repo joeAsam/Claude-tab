@@ -120,6 +120,11 @@ nudged automatically to the nearest pause in speech.
 must make people want to watch without spoiling the payoff: tease, ask, or \
 provoke (e.g. "He did NOT expect this", "Worst timing ever", "Wait for the \
 ending"). No emoji, no hashtags.
+- post_caption (in finish_clip): the caption the clip is posted with on TikTok and \
+YouTube Shorts. One punchy sentence naming the streamer and what happens (an emoji \
+or two is fine), then 4-8 hashtags: the streamer's name, the game, and broad ones \
+like #fyp. For example: "IShowSpeed Was NOT Ready For What GTA 6 Did 😭 #ishowspeed \
+#gta6 #gta #streamer #fyp". Never claim something that didn't happen in the clip.
 
 ## Editing (call finish_clip for every clip you cut)
 - create_clip returns what was said and how chat reacted, with times in seconds \
@@ -180,6 +185,7 @@ class ClipAgentConfig:
     music: bool = True
     hook: bool = True
     fixed_hook: str | None = None  # same hook text on every clip, instead of Claude writing one
+    on_finished: object = None  # optional callable(clip), e.g. to post the clip through Buffer
 
 
 class Timeline:
@@ -466,6 +472,7 @@ class ClipAgent:
             music_volume: float = 0.15,
             captions: bool = True,
             hook: str = "",
+            post_caption: str = "",
         ) -> str:
             """Edit a clip made by create_clip and save the finished video.
 
@@ -476,6 +483,7 @@ class ClipAgent:
                 music_volume: Music loudness from 0.05 (subtle) to 0.4 (loud); 0.15 suits most clips.
                 captions: Whether to burn in captions synced to the speech.
                 hook: Optional replacement for the hook given to create_clip, e.g. after reading the speech.
+                post_caption: Caption for posting on TikTok/YouTube Shorts: one punchy sentence plus 4-8 hashtags.
             """
             clip = next((c for c in self.clips if c.id == clip_id), None)
             if not clip:
@@ -484,6 +492,8 @@ class ClipAgent:
                 return f"Error: {clip_id} is already finished ({clip.path.name})."
             if hook.strip():
                 clip.edits["hook"] = hook.strip()
+            if post_caption.strip():
+                clip.edits["post_caption"] = post_caption.strip()
             try:
                 path = self._finish(clip, sound_effects, music, music_volume, captions)
             except ValueError as exc:
@@ -603,6 +613,11 @@ class ClipAgent:
             "music": music if music_path else "none",
         }
         self._log_clip(clip)
+        if self.cfg.on_finished:
+            try:
+                self.cfg.on_finished(clip)
+            except Exception as exc:  # posting problems must never lose the clip itself
+                log.error("Posting %s failed (the clip is saved at %s): %s", clip.id, out, exc)
         clip.raw_path.unlink(missing_ok=True)
         if overlay:
             overlay.unlink(missing_ok=True)

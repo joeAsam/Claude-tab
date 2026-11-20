@@ -57,6 +57,13 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--whisper-model", default="base",
                    help="faster-whisper model for captions: tiny, base, small, medium, large-v3")
 
+    g = p.add_argument_group("posting (Buffer)")
+    g.add_argument("--post-to-buffer", action="store_true",
+                   help="Queue each finished clip on your Buffer channels (needs BUFFER_API_KEY and CLOUDINARY_URL)")
+    g.add_argument("--buffer-channels", default="tiktok",
+                   help="Comma-separated Buffer channels to post to: service, name or ID (default: tiktok)")
+    g.add_argument("--youtube-category", default="20", help="YouTube category ID for Shorts (20 = Gaming)")
+
     g = p.add_argument_group("video files / screen recordings")
     g.add_argument("--max-clips", type=int, default=10, help="Stop after this many clips (default 10)")
     g.add_argument("--max-reviews", type=int, default=15,
@@ -130,8 +137,27 @@ def setup(args) -> bool:
     return True
 
 
+def make_poster(args):
+    """Returns a callback that queues a finished clip on Buffer, or None if posting is off."""
+    if not args.post_to_buffer:
+        return None
+    from .publish import PostPlan, Publisher, default_caption
+
+    publisher = Publisher([c for c in args.buffer_channels.split(",") if c.strip()],
+                          args.out / "posted.jsonl", args.youtube_category)
+    log.info("Posting is on: finished clips are queued on %s",
+             ", ".join(f"{c['name']} ({c['service']})" for c in publisher.channels))
+
+    def post(clip) -> None:
+        caption = clip.edits.get("post_caption") or default_caption(clip.title, clip.edits.get("hook"))
+        publisher.post(PostPlan(clip.path, caption, clip.title))
+
+    return post
+
+
 def agent_config(args) -> ClipAgentConfig:
     return ClipAgentConfig(
+        on_finished=make_poster(args),
         out_dir=args.out,
         assets_dir=args.assets,
         vertical=args.vertical,
